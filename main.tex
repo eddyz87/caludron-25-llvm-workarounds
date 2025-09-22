@@ -1,0 +1,459 @@
+\batchmode
+\PassOptionsToPackage{prologue,dvipsnames}{xcolor}
+% don't show red boxes around lexing errors
+\AtBeginEnvironment{minted}{\renewcommand{\fcolorbox}[4][]{#4}}
+\documentclass{beamer}
+\setbeamersize{text margin left=15pt,text margin right=15pt} 
+\setbeamertemplate{frametitle continuation}{\usebeamerfont{frametitle}\small{(\insertcontinuationcount)}}
+
+%%\usepackage[dvipsnames]{xcolor}
+
+\usepackage{minted}
+\setminted{escapeinside=!!}
+\setminted{fontsize=\small}
+%%\setminted{ignorelexererrors=true}
+
+\usepackage{parskip}
+\setlength{\parskip}{\medskipamount} 
+
+%%\usepackage{noto}
+\usepackage[scaled]{beramono}
+\usepackage[T1]{fontenc}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\marker}[2]{\colorbox{#1}{#2}}
+\newcommand{\green }[1]{\marker{SpringGreen!40}{#1}}
+\newcommand{\yellow}[1]{\marker{Goldenrod!40}{#1}}
+\newcommand{\blue  }[1]{\marker{SkyBlue!40}{#1}}
+
+\title{LLVM BPF backend optimizer workarounds}
+\date{}
+
+\begin{document}
+
+\frame{\titlepage}
+
+\begin{frame}[fragile]
+\frametitle{Preface}
+
+Over the years LLVM BPF backend accumulated a number of
+transformations, aiming to preserve input C code structure from
+optimizer rewrites, where such rewrites are at odds with kernel BPF
+verifier understanding the code.
+
+I'll give a short overview of the BPF verifier itself, and describe
+the patterns each such transformation tries to preserve.
+
+\end{frame}
+
+\begin{frame}[allowframebreaks,fragile]
+  \frametitle{Kernel BPF verifier}
+
+  At it's core Linux Kernel BPF verifier is a path-tracing machine.
+  \begin{columns}[t]
+    \column{{0.45\textwidth}}
+    \scriptsize
+    \begin{itemize}
+    \item It simulates instruction execution one-by-one.
+    \item Forks the state at branching points.
+    \item Tracks register and stack state.
+    \end{itemize}
+    \column{{0.65\textwidth}}
+    \begin{minted}[highlightlines={2,10,13,22},fontsize=\tiny]{c}
+Live regs before insn:
+    0: .......... (85) call bpf_get_prandom_u32
+    1: 0......... (bf) r1 = r0
+    2: 01........ (07) r1 += 5
+.-- 3: 01........ (35) if r0 >= 0x5 goto pc+5
+|   4: .1........ (18) r0 = 0xffffc90000188000
+|   6: 01........ (0f) r0 += r1
+|   7: 0......... (71) r0 = *(u8 *)(r0 +0)
+|   8: 0......... (95) exit
+'-> 9: .......... (b7) r0 = 42
+   10: 0......... (95) exit
+
+0: (85) call bpf_get_prandom_u32 ; !\scalebox{.9}[1.0]{R0=scalar()}!
+1: (bf) r1 = r0                  ; !\scalebox{.9}[1.0]{R0=scalar(id=1) R1=scalar(id=1)}!
+2: (07) r1 += 5                  ; !\scalebox{.9}[1.0]{R1=scalar(id=1+5)}!
+3: (35) if r0 >= 0x5 goto pc+5   ; !\scalebox{.9}[1.0]{R0=scalar(id=1,umin=0,umax=4)}!
+4: (18) r0 = 0xffffc90000188000  ; !\scalebox{.9}[1.0]{R0=map\_value()}!
+6: (0f) r0 += r1                 ; !\scalebox{.9}[1.0]{R0=map\_value(umin=5,umax=9)}!
+7: (71) r0 = *(u8 *)(r0 +0)      ; !\scalebox{.9}[1.0]{R0=scalar(umin=0,umax=255)}!
+8: (95) exit
+
+from 3 to 9: !\scalebox{.9}[1.0]{R0=scalar(id=1,umin=5) R1=scalar(id=1) R10=fp0}!
+9: (b7) r0 = 42                  ; !\scalebox{.9}[1.0]{R0=42}!
+10: (95) exit      
+    \end{minted}
+  \end{columns}
+
+  \framebreak
+
+    \scriptsize
+    \begin{itemize}
+    \item Interval and known bits abstract domains are used to represent values.
+    \item Linear relations of form $r_u + a == r_v + b$ are tracked
+      for 64-bit registers and slots.
+    \item Only addition and jump instructions preserve the relations.
+    \end{itemize}
+
+    \begin{minted}[fontsize=\tiny,highlightlines={2,3,4,6}]{c}
+0: (85) call bpf_get_prandom_u32    ; R0=scalar()
+1: (bf) r1 = r0                     ; R0=scalar(id=1) R1=scalar(id=1)
+2: (07) r1 += 5                     ; R1=scalar(id=1+5)
+3: (35) if r0 >= 0x5 goto pc+5      ; R0=scalar(id=1,umin=0,umax=4)
+4: (18) r0 = 0xffffc90000188000     ; R0=map_value()
+6: (0f) r0 += r1                    ; R0=map_value(umin=5,umax=9)
+7: (71) r0 = *(u8 *)(r0 +0)         ; R0=scalar(umin=0,umax=255)
+8: (95) exit
+
+from 3 to 9: R0=scalar(id=1,umin=5) R1=scalar(id=1) R10=fp0
+9: R0=scalar(id=1,umin=5) R1=scalar(id=1) R10=fp0
+9: (b7) r0 = 42                     ; R0=42
+10: (95) exit      
+    \end{minted}
+
+    
+%     \begin{minted}[fontsize=\tiny,highlightlines={2,3,4,6}]{c}
+% 0: (85) call bpf_get_prandom_u32    ; R0=scalar()
+% 1: (bf) r1 = r0                     ; R0=scalar(id=1) R1=scalar(id=1)
+% 2: (07) r1 += 5                     ; R1=scalar(id=1+5)
+% 3: (35) if r0 >= 0x5 goto pc+5      ; R0=scalar(id=1,umin=0,umax=4)
+% 4: (18) r0 = 0xffffc90000188000     ; R0=map_value()
+% 6: (0f) r0 += r1                    ; R0=map_value(umin=5,umax32=9)
+% 7: (71) r0 = *(u8 *)(r0 +0)         ; R0=scalar(umin=0,umax=255)
+% 8: (95) exit
+%     \end{minted}
+
+\end{frame}
+
+\begin{frame}[allowframebreaks,fragile]
+  \frametitle{Address calculation hoisting}
+
+  From C point of view the two programs below are identical:
+  \vspace{0.5cm}
+
+  \begin{columns}
+    \column{0.35\textwidth}
+    \begin{minipage}{\textwidth}
+      \begin{minted}{C}
+off = ...
+if (off < 42) {
+  ptr = packet + off;
+  ... *ptr ...
+}
+      \end{minted}
+    \end{minipage}
+    \column{0.1\textwidth}
+    $\rightarrow$
+    \column{0.5\textwidth}
+    \begin{minipage}{\textwidth}
+      \begin{minted}{C}
+off = ...
+ptr = packet + off;
+if (off < 42) {
+  ... *ptr ...
+}
+      \end{minted}
+    \end{minipage}
+  \end{columns}
+
+  \framebreak
+
+Verifier does not track relations between scalars and pointers, so it
+can't propagate range backwards from \code{off} to \code{ptr}.
+
+  \begin{minted}{C}
+off = ...
+ptr = packet + off;
+if (off < 42) {
+  ... *ptr ... /* !\textcolor{red}{verification error here}! */
+}
+  \end{minted}
+
+  \framebreak
+
+LLVM BPF backend attempts to block such code motion by inserting
+special intrinsic calls\footnote{\tiny{Handled by \code{BPFAdjustOptImpl::avoidSpeculation()}.}}:
+
+  \begin{minted}{C}
+!\blue{off}! = ...
+if (!\yellow{off < 42}!) {
+  off = !\textcolor{Red}{@llvm.bpf.passthrough.i32.i32}!(<uid>, i32 off);
+  ptr = packet !\green{+ off}!;
+  ... *ptr ...
+}
+  \end{minted}
+
+By matching value \blue{definition}, \yellow{icmp} and \green{address calculation} pattern.
+
+\end{frame}
+
+\begin{frame}[allowframebreaks,fragile]
+  \frametitle{\code{x < a || x > b}}
+
+  LLVM's \code{InstCombine} is a huge set of peephole rewrite patterns. \\
+  One of these patterns looks as follows:
+
+  \vspace{0.5cm}
+
+  \begin{columns}
+    \column{0.3\textwidth}
+    \begin{minipage}{\textwidth}
+      \begin{minted}{C}
+if (v < 1)
+        return 0;
+if (v > 7)
+        return 0;
+return arr[v];
+      \end{minted}
+    \end{minipage}
+    \column{0.1\textwidth}
+    $\rightarrow$
+    \column{0.45\textwidth}
+    \begin{minipage}{\textwidth}
+      \begin{minted}{C}
+t = v;
+t -= 8;
+if ((u32)t < (u32)-7)
+	return 0;
+return arr[v];
+      \end{minted}
+    \end{minipage}
+  \end{columns}
+
+  \framebreak
+
+  This is a problem for verifier:
+
+  \begin{minted}[fontsize=\fontsize{7}{8},frame=lines,framesep=5mm,highlightlines=3]{c}
+  ...  w1 = v, w2 = t ...
+  3: (bc) w2 = w1                       ; R1=R2=scalar(id=1,umin=0,umax=0xffffffff)
+  4: (04) w2 += -8                      ; R2=scalar(umin=0,umax=0xffffffff...)
+  5: (a6) if w2 < 0xfffffff9 goto pc+5  ; R2=scalar(...smin32=-7,smax32=-1...)
+  6: (bc) w1 = w1                       ; R1=scalar(id=1,umin=0,umax=0xffffffff...)
+  7: (18) r2 = <arr> ll                 ; R2=map_value(...)
+  9: (0f) r2 += r1
+  10: (71) r0 = *(u8 *)(r2 +0)
+  R2 unbounded memory access, make sure to bounds check any such access
+  \end{minted}
+
+    %%\vspace{0.5cm}
+
+At (4) verifier drops relationship between `r1` and `r2`, as it does
+not track linear relations after 32-bit operations.
+
+  \framebreak
+
+The workaround is two hide the fact that both conditionals work on a
+same value from optimizer.
+
+Match a sequence of basic blocks:
+
+\begin{minted}[fontsize=\small]{llvm}
+entry:
+  %cmp = icmp ult i64 %x, 1
+  br i1 %cmp, label %if.then, label %if.end
+
+if.end:
+  %cmp1 = icmp ugt i64 %x, 7
+  br i1 %cmp1, label %if.then2, label %if.end3
+\end{minted}
+
+  \framebreak
+
+  And break the pattern for \code{InstCombine} by obfuscating
+  \code{\%x} value for the first \code{icmp}
+  \footnote{\tiny{\parbox{\textwidth}{
+        \code{Handled by BPFAdjustOptImpl::serializeICMPCrossBB()} and\\
+        \code{BPFAdjustOptImpl::serializeICMPInBB()}.  }}}:
+
+\begin{minted}[fontsize=\small,highlightlines=3]{llvm}
+entry:
+  %cmp = icmp ult i64 %x, 1
+  %2 = call i1 @llvm.bpf.passthrough.i1.i1(i32 2, i1 %cmp)
+  br i1 %2, label %if.then, label %if.end
+
+if.end:
+  %cmp1 = icmp ugt i64 %x, 7
+  br i1 %cmp1, label %if.then2, label %if.end3
+\end{minted}
+    
+\end{frame}
+
+\begin{frame}[allowframebreaks,fragile]
+  \frametitle{\code{if (x <= $2^n$) \hspace{1em}...}}
+
+Same \code{InstCombine} pass applies the following transformation:
+
+  \vspace{0.5cm}
+
+  \begin{columns}
+    \column{0.45\textwidth}
+    \begin{minipage}{\textwidth}
+      \begin{minted}{C}
+int foo(long x) {
+  if ((unsigned)x <= !$2^n$!)
+    return arr[x];
+  return 0;
+}
+      \end{minted}
+    \end{minipage}
+    \column{0.1\textwidth}
+    $\rightarrow$
+    \column{0.45\textwidth}
+    \begin{minipage}{\textwidth}
+      \begin{minted}{C}
+int foo(long x) {
+  if (x & (!$2^{32} - 2^n$!))
+    return arr[x];
+  return 0;
+}
+      \end{minted}
+    \end{minipage}
+  \end{columns}
+
+  \framebreak
+  
+  This is a problem for verifier:
+
+  \begin{minted}[fontsize=\fontsize{7}{8},frame=lines,framesep=5mm,highlightlines={4,5}]{c}
+ 6: (18) r2 = 0xfffffffe              ; R2=0xfffffffe
+; if ((unsigned)x <= 1) {
+ 8: (bf) r3 = r1                      ; R1=scalar(id=1) R3=scalar(id=1)
+ 9: (5f) r3 &= r2                     ; R3=scalar(...umin=0,umax=0xfffffffe...)
+10: (55) if r3 != 0x0 goto pc+6       ; R3=0
+; return arr[x];
+11: (18) r2 = <arr> ll                ; R2=map_value(...)
+13: (0f) r2 += r1
+math between map_value pointer and register with unbounded min value is not allowed
+  \end{minted}
+
+At (9) \code{r3 \&= r2} breaks the relation between \code{r3} and \code{r2}.\\
+At (10) no range for \code{r1} inferred from \code{r3 == 0} branch entry.
+
+  \framebreak
+
+  The workaround is two hide comparison from optimizer, by mathcing
+  this specifi pattern:
+
+\begin{minted}[fontsize=\small]{llvm}
+  %cmp = icmp ule i32 %conv, 1   ; <------- !$2^n$! RHS
+  br i1 %cmp, label %if.then, label %if.end
+\end{minted}
+
+And replace it with the a call to a backend specific intrinsic:
+
+\begin{minted}[fontsize=\small]{llvm}
+  %0 = call i1 @llvm.bpf.compare.i32.i32
+                  (i32 37, i32 %conv, i32 1)
+  br i1 %0, label %if.then, label %if.end
+\end{minted}
+  
+\end{frame}
+
+\begin{frame}[allowframebreaks,fragile]
+  \frametitle{\large\code{\_\_attribute\_\_((preserve\_static\_offset))}}
+
+  Verifier has a concept of ``context'' types:
+  \begin{itemize}
+  \item describe input parameters of BPF programs
+  \item C-level representation for BPF programs differs from physical layout
+  \item as a part of the verification process, load and store
+    instructions with static offsets are patched to use correct physical layout.
+
+  For example:
+
+  \begin{minted}[fontsize=\footnotesize]{c}
+int foo(struct bpf_sockopt *ctx) {
+	... ctx->retval ...      
+}
+  \end{minted}
+
+  Is translated as \code{*(u32 *)(r1 + 36)}, and is patched to an
+  equivalent of:
+
+  \begin{minted}[fontsize=\footnotesize]{c}
+(struct sockopt_kern *)r1->current_task->bpf_ctx->retval
+  \end{minted}
+  \end{itemize}
+
+  \framebreak
+
+  Such mechanics fails if compiler decouples computation of the
+  access address and load/store instruction, e.g.:
+
+  \begin{columns}
+    \column{0.35\textwidth}
+    \begin{minted}[fontsize=\footnotesize]{c}
+switch (ctx->level) {
+case 10:
+  g = !\textcolor{Red}{bar}!(ctx->sk->family);
+  break;
+case 20:
+  g = !\textcolor{Red}{bar}!(ctx->optlen);
+  break;
+}
+return g % 2;
+    \end{minted}
+
+    \column{0.05\textwidth}
+    $\rightarrow$
+    \column{0.45\textwidth}
+
+    \begin{minted}[fontsize=\footnotesize]{c}
+switch (ctx->level) {
+case 10:
+  p = (void *)ctx->sk + 4;
+  break;
+case 20:
+  p = ctx + 32;
+  break;
+}
+g = !\textcolor{Red}{bar}!(*p);
+return g % 2;
+    \end{minted}
+  \end{columns}
+
+  \framebreak
+
+  Verifier rejects programs after such transformations:
+
+  \begin{minted}[fontsize=\fontsize{7}{8},frame=lines,framesep=5mm,highlightlines={7,8}]{c}
+; switch (ctx->level) {
+0: (61) r2 = *(u32 *)(r1 +24)         ; R1=ctx() R2=scalar(...)
+1: (16) if w2 == 0x14 goto pc+5       ; R2=scalar(...)
+2: (b4) w0 = 0                        ; R0=0
+3: (56) if w2 != 0xa goto pc+7        ; R2=10
+; g = bar(ctx->sk->family);
+4: (79) r1 = *(u64 *)(r1 +0)          ; R1=sock()
+5: (07) r1 += 4
+R1 pointer arithmetic on sock prohibited
+  \end{minted}
+
+  \framebreak
+
+  The workaround is to use a special attribute that informs BPF
+  backend to apply the following transformation before main optimizer
+  passes:
+
+  \begin{minted}[fontsize=\footnotesize]{c}
+struct bpf_sockopt { ... } __attribute__((preserve_static_offset));
+...
+switch (!\textcolor{Red}{@llvm.bpf.getelementptr.and.load.i32}!(ctx, 24)) {
+case 10:
+  g = bar(ctx->sk->family); // offsets of 0 are not tinkered with
+  break;
+case 20:
+  g = bar(!\textcolor{Red}{@llvm.bpf.getelementptr.and.load.i32}!(ctx, 32));
+  break;
+}
+  \end{minted}
+
+  \code{llvm.bpf.getelementptr.and.load} calls are replaced by actual
+  \code{getelementptr} and \code{load} pairs right before IR
+  translation to machine code.
+
+\end{frame}
+
+\end{document}
