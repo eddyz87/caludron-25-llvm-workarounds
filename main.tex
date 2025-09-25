@@ -36,13 +36,24 @@
 \begin{frame}[fragile]
 \frametitle{Preface}
 
-Over the years LLVM BPF backend accumulated a number of
-transformations, aiming to preserve input C code structure from
-optimizer rewrites, where such rewrites are at odds with kernel BPF
-verifier understanding the code.
+\begin{itemize}
+\item Optimizing compiler transforms the structure of the input C code.
+\item Sometimes such transformations deter Linux kernel BPF verifier
+      from reasoning about the program.
+\item LLVM BPF backend accumulated a number of transformations
+      aimed at preventing certain optimizations to happen.
+\item This presentation to enumerates these backend transformations.
+\item The goal of the presentation is to discuss how GCC BPF backend
+      addresses or plans to address the same issues.
+\end{itemize}
 
-I'll give a short overview of the BPF verifier itself, and describe
-the patterns each such transformation tries to preserve.
+%% Over the years, LLVM BPF backend accumulated a number of
+%% transformations aimed at preserving the structure of the input C code
+%% from optimizer rewrites, where those rewrites conflict with kernel BPF
+%% verifier understanding the code.
+
+%% I'll give a short overview of the BPF verifier itself, and describe
+%% the patterns each such transformation tries to preserve.
 
 \end{frame}
 
@@ -51,14 +62,14 @@ the patterns each such transformation tries to preserve.
 
   At it's core Linux Kernel BPF verifier is a path-tracing machine.
   \begin{columns}[t]
-    \column{{0.45\textwidth}}
+    \column{0.45\textwidth}
     \scriptsize
     \begin{itemize}
     \item It simulates instruction execution one-by-one.
     \item Forks the state at branching points.
     \item Tracks register and stack state.
     \end{itemize}
-    \column{{0.65\textwidth}}
+    \column{0.65\textwidth}
     \begin{minted}[highlightlines={2,10,13,22},fontsize=\tiny]{c}
 Live regs before insn:
     0: .......... (85) call bpf_get_prandom_u32
@@ -454,6 +465,44 @@ case 20:
   \code{getelementptr} and \code{load} pairs right before IR
   translation to machine code.
 
+\end{frame}
+
+\begin{frame}
+\frametitle{User visible workarounds}
+
+The set of transformations applied by LLVM backend is
+nowhere from being a complete remedy. This is evident
+from kernel bpf selftests themselves:
+
+\begin{itemize}
+\item \code{volatile} is used 302 times in 918 files.
+\item \code{asm volatile("" : "+r"(var))} is used 26 times.
+\end{itemize}
+
+The issues are mostly similar to those already described. \\
+(No detailed case study available).
+
+\end{frame}
+
+\begin{frame}
+\frametitle{Conclusion}
+\begin{itemize}
+\item LLVM BPF backend strategy is so far reactive,
+      targeted counter-transformations are added when new
+      patterns are identified.
+\item What is the strategy for GCC BPF backend?
+\item Do we want to agree on certain \code{-Overifyable},
+      suggested some time ago by Jose Marchesi? \\
+      If we do, how should it be implemented:
+      \begin{itemize}
+      \item By targeted IR alternations, as LLVM does?
+      \item By backend specific checks in optimizations
+            themselves \\ (an option rejected by LLVM upstream)?
+      \item Given a big number of user-visible workarounds,
+            even an optimization pipeline completely separate
+            from existing \code{-O2} might be interesting.
+      \end{itemize}
+\end{itemize}
 \end{frame}
 
 \end{document}
