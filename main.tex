@@ -38,14 +38,15 @@
 
 \begin{itemize}
 \item Optimizing compiler transforms the structure of the input C code.
-\item Sometimes such transformations deter Linux kernel BPF verifier
-      from reasoning about the program.
-\item LLVM BPF backend accumulated a number of transformations
-      aimed at preventing certain optimizations to happen.
-\item This presentation to enumerates these backend transformations.
-\item The goal of the presentation is to discuss how GCC BPF backend
-      addresses or plans to address the same issues.
-\item Another goal is to resurrect discussion about \code{-Overifyable}.
+\item Sometimes, such transformations obscure the Linux kernel BPF
+  verifier's ability to reason about the program.
+\item LLVM BPF backend has accumulated a number of transformations
+  aimed at preventing certain optimizations from being applied.
+\item This presentation enumerates these backend transformations.
+\item The goal of this presentation is to discuss how GCC BPF backend
+  addresses, or plans to address, the same issues.
+\item Another goal is to revive the discussion about
+  \code{-Overifyable} compiler option.
 \end{itemize}
 
 %% Over the years, LLVM BPF backend accumulated a number of
@@ -66,7 +67,7 @@
     \column{0.45\textwidth}
     \scriptsize
     \begin{itemize}
-    \item It simulates instruction execution one-by-one.
+    \item It simulates instructions execution one-by-one.
     \item Forks the state at branching points.
     \item Tracks register and stack state.
     \end{itemize}
@@ -103,10 +104,11 @@ from 3 to 9: !\scalebox{.9}[1.0]{R0=scalar(id=1,umin=5) R1=scalar(id=1) R10=fp0}
 
     \scriptsize
     \begin{itemize}
-    \item Interval and known bits abstract domains are used to represent values.
-    \item Linear relations of form $r_u + a == r_v + b$ are tracked
-      for 64-bit registers and slots.
-    \item Only addition and jump instructions preserve the relations.
+    \item The interval and known bits abstract domains are used to
+      represent values.
+    \item Linear relations of the form $r_u + a = r_v + b$ are tracked
+      for 64-bit registers and stack slots.
+    \item Only addition and jump instructions preserve these relations.
     \end{itemize}
 
     \begin{minted}[fontsize=\tiny,highlightlines={2,3,4,6}]{c}
@@ -125,25 +127,27 @@ from 3 to 9: R0=scalar(id=1,umin=5) R1=scalar(id=1) R10=fp0
 10: (95) exit      
     \end{minted}
 
-    
-%     \begin{minted}[fontsize=\tiny,highlightlines={2,3,4,6}]{c}
-% 0: (85) call bpf_get_prandom_u32    ; R0=scalar()
-% 1: (bf) r1 = r0                     ; R0=scalar(id=1) R1=scalar(id=1)
-% 2: (07) r1 += 5                     ; R1=scalar(id=1+5)
-% 3: (35) if r0 >= 0x5 goto pc+5      ; R0=scalar(id=1,umin=0,umax=4)
-% 4: (18) r0 = 0xffffc90000188000     ; R0=map_value()
-% 6: (0f) r0 += r1                    ; R0=map_value(umin=5,umax32=9)
-% 7: (71) r0 = *(u8 *)(r0 +0)         ; R0=scalar(umin=0,umax=255)
-% 8: (95) exit
-%     \end{minted}
+\end{frame}
 
+\begin{frame}
+  \frametitle{The list of backend transformations}
+
+  The next few slides showcase patterns that the BPF backend attempts
+  to block the LLVM optimizer from matching.
+
+  \begin{itemize}
+    \item Address calculation hoisting
+    \item \code{x < a || x > b} rewrite
+    \item \code{if (x <= $2^n$) ...} rewrite
+    \item \code{\_\_attribute\_\_((preserve\_static\_offset))}
+  \end{itemize}
 \end{frame}
 
 \begin{frame}[allowframebreaks,fragile]
   \frametitle{Address calculation hoisting}
 
   From C point of view the two programs below are identical:
-  \vspace{0.5cm}
+  \vspace{1cm}
 
   \begin{columns}
     \column{0.35\textwidth}
@@ -172,15 +176,16 @@ if (off < 42) {
 
   \framebreak
 
-Verifier does not track relations between scalars and pointers, so it
-can't propagate range backwards from \code{off} to \code{ptr}.
+  The verifier does not track relations between scalars and pointers,
+  so it cannot propagate range information backward from \code{off} to
+  \code{ptr}.
 
   \begin{minted}{C}
-off = ...
-ptr = packet + off;
-if (off < 42) {
-  ... *ptr ... /* !\textcolor{red}{verification error here}! */
-}
+  off = ...
+  ptr = packet + off;
+  if (off < 42) {
+    ... *ptr ... /* !\textcolor{red}{verification error here}! */
+  }
   \end{minted}
 
   \framebreak
@@ -189,12 +194,12 @@ LLVM BPF backend attempts to block such code motion by inserting
 special intrinsic calls\footnote{\tiny{Handled by \code{BPFAdjustOptImpl::avoidSpeculation()}.}}:
 
   \begin{minted}{C}
-!\blue{off}! = ...
-if (!\yellow{off < 42}!) {
-  off = !\textcolor{Red}{@llvm.bpf.passthrough.i32.i32}!(<uid>, i32 off);
-  ptr = packet !\green{+ off}!;
-  ... *ptr ...
-}
+  !\blue{off}! = ...
+  if (!\yellow{off < 42}!) {
+    off = !\textcolor{Red}{@llvm.bpf.passthrough.i32.i32}!(<uid>, i32 off);
+    ptr = packet !\green{+ off}!;
+    ... *ptr ...
+  }
   \end{minted}
 
 By matching value \blue{definition}, \yellow{icmp} and \green{address calculation} pattern.
@@ -204,12 +209,13 @@ By matching value \blue{definition}, \yellow{icmp} and \green{address calculatio
 \begin{frame}[allowframebreaks,fragile]
   \frametitle{\code{x < a || x > b}}
 
-  LLVM's \code{InstCombine} is a huge set of peephole rewrite patterns. \\
-  One of these patterns looks as follows:
+  LLVM's \code{InstCombine} pass consists of a large set of peephole
+  rewrite patterns. One these patterns looks as follows:
 
-  \vspace{0.5cm}
+  \vspace{1cm}
 
   \begin{columns}
+    \hspace{.5cm}
     \column{0.3\textwidth}
     \begin{minipage}{\textwidth}
       \begin{minted}{C}
@@ -238,9 +244,11 @@ return arr[v];
 
   This is a problem for verifier:
 
-  \begin{minted}[fontsize=\fontsize{7}{8},frame=lines,framesep=5mm,highlightlines=3]{c}
+  \begin{minted}[fontsize=\fontsize{7}{8},frame=lines,framesep=5mm,highlightlines=5]{c}
   ...  w1 = v, w2 = t ...
+; t = v;
   3: (bc) w2 = w1                       ; R1=R2=scalar(id=1,umin=0,umax=0xffffffff)
+; t -= 8;
   4: (04) w2 += -8                      ; R2=scalar(umin=0,umax=0xffffffff...)
   5: (a6) if w2 < 0xfffffff9 goto pc+5  ; R2=scalar(...smin32=-7,smax32=-1...)
   6: (bc) w1 = w1                       ; R1=scalar(id=1,umin=0,umax=0xffffffff...)
@@ -252,33 +260,34 @@ return arr[v];
 
     %%\vspace{0.5cm}
 
-At (4) verifier drops relationship between `r1` and `r2`, as it does
-not track linear relations after 32-bit operations.
+  At (4) verifier drops relationship between \code{r1} and \code{r2},
+  as it does not preserve linear relations after 32-bit operations.
 
   \framebreak
 
-The workaround is two hide the fact that both conditionals work on a
-same value from optimizer.
+The workaround is to hide from the optimizer the fact that both
+conditionals operate on the same value.
 
 Match a sequence of basic blocks:
 
 \begin{minted}[fontsize=\small]{llvm}
 entry:
-  %cmp = icmp ult i64 %x, 1
-  br i1 %cmp, label %if.then, label %if.end
+  %cmp = icmp ult i64 !\green{%x}!, 1
+  br i1 %cmp, label %if.then, label !\yellow{%if.end}!
 
-if.end:
-  %cmp1 = icmp ugt i64 %x, 7
+!\yellow{if.end}!:
+  %cmp1 = icmp ugt i64 !\green{%x}!, 7
   br i1 %cmp1, label %if.then2, label %if.end3
 \end{minted}
 
   \framebreak
 
-  And break the pattern for \code{InstCombine} by obfuscating
-  \code{\%x} value for the first \code{icmp}
-  \footnote{\tiny{\parbox{\textwidth}{
+  And break the pattern by obfuscating \code{\%x} for the first
+  \code{icmp} \footnote{\tiny{\parbox{\textwidth}{
         \code{Handled by BPFAdjustOptImpl::serializeICMPCrossBB()} and\\
-        \code{BPFAdjustOptImpl::serializeICMPInBB()}.  }}}:
+        \code{BPFAdjustOptImpl::serializeICMPInBB()}. }}}:
+
+  \vspace{0.5cm}
 
 \begin{minted}[fontsize=\small,highlightlines=3]{llvm}
 entry:
@@ -294,13 +303,14 @@ if.end:
 \end{frame}
 
 \begin{frame}[allowframebreaks,fragile]
-  \frametitle{\code{if (x <= $2^n$) \hspace{1em}...}}
+  \frametitle{\code{if (x <= $2^n$) ...}}
 
 Same \code{InstCombine} pass applies the following transformation:
 
-  \vspace{0.5cm}
+  \vspace{1cm}
 
   \begin{columns}
+    \hspace{0.5cm}
     \column{0.45\textwidth}
     \begin{minipage}{\textwidth}
       \begin{minted}{C}
@@ -341,8 +351,8 @@ int foo(long x) {
 math between map_value pointer and register with unbounded min value is not allowed
   \end{minted}
 
-At (9) \code{r3 \&= r2} breaks the relation between \code{r3} and \code{r2}.\\
-At (10) no range for \code{r1} inferred from \code{r3 == 0} branch entry.
+At (9), \code{r3 \&= r2} breaks the relation between \code{r3} and \code{r2}.\\
+At (10), no range for \code{r1} can be inferred from the \code{r3 == 0} branch entry.
 
   \framebreak
 
@@ -350,7 +360,7 @@ At (10) no range for \code{r1} inferred from \code{r3 == 0} branch entry.
   this specifi pattern:
 
 \begin{minted}[fontsize=\small]{llvm}
-  %cmp = icmp ule i32 %conv, 1   ; <------- !$2^n$! RHS
+  %cmp = icmp ule i32 %conv, !$2^n$!
   br i1 %cmp, label %if.then, label %if.end
 \end{minted}
 
@@ -358,7 +368,7 @@ And replace it with the a call to a backend specific intrinsic:
 
 \begin{minted}[fontsize=\small]{llvm}
   %0 = call i1 @llvm.bpf.compare.i32.i32
-                  (i32 37, i32 %conv, i32 1)
+                 (i32 37, i32 %conv, i32 !$2^n$!)
   br i1 %0, label %if.then, label %if.end
 \end{minted}
   
@@ -367,33 +377,36 @@ And replace it with the a call to a backend specific intrinsic:
 \begin{frame}[allowframebreaks,fragile]
   \frametitle{\large\code{\_\_attribute\_\_((preserve\_static\_offset))}}
 
-  Verifier has a concept of ``context'' types:
+  Verifier has a concept of ``context'' types, which:
   \begin{itemize}
-  \item describe input parameters of BPF programs
-  \item C-level representation for BPF programs differs from physical layout
-  \item as a part of the verification process, load and store
-    instructions with static offsets are patched to use correct physical layout.
-
-  For example:
-
-  \begin{minted}[fontsize=\footnotesize]{c}
-int foo(struct bpf_sockopt *ctx) {
-	... ctx->retval ...      
-}
-  \end{minted}
-
-  Is translated as \code{*(u32 *)(r1 + 36)}, and is patched to an
-  equivalent of:
-
-  \begin{minted}[fontsize=\footnotesize]{c}
-(struct sockopt_kern *)r1->current_task->bpf_ctx->retval
-  \end{minted}
+  \item describe the input parameters of BPF programs;
+  \item provide a C-level representation for BPF programs that differs
+    from physical layout of kernel data structures.
   \end{itemize}
+
+  As part of the verification process, load and store instructions
+  operating on these types are patched to use the correct physical
+  layout, e.g.:
+
+  \begin{minted}[fontsize=\footnotesize]{c}
+  int foo(struct bpf_sockopt *ctx) {
+	... ctx->retval ...      
+  }
+  \end{minted}
+
+  Is translated as \code{r$_x$ = *(u32 *)(r1 \textcolor{Red}{+ 36})} and is
+  patched to an equivalent of:
+
+  \begin{minted}[fontsize=\footnotesize]{c}
+  (struct sockopt_kern *)r1->current_task->bpf_ctx->retval
+  \end{minted}
+
+  Matched patterns must have a \textcolor{Red}{static offset}.
 
   \framebreak
 
-  Such mechanics fails if compiler decouples computation of the
-  access address and load/store instruction, e.g.:
+  Such mechanics fail if the compiler decouples the computation of the
+  access address from the load/store instruction, e.g.:
 
   \begin{columns}
     \column{0.35\textwidth}
@@ -429,7 +442,7 @@ return g % 2;
 
   \framebreak
 
-  Verifier rejects programs after such transformations:
+  Verifier rejects programs after such transformation:
 
   \begin{minted}[fontsize=\fontsize{7}{8},frame=lines,framesep=5mm,highlightlines={7,8}]{c}
 ; switch (ctx->level) {
@@ -445,21 +458,20 @@ R1 pointer arithmetic on sock prohibited
 
   \framebreak
 
-  The workaround is to use a special attribute that informs BPF
-  backend to apply the following transformation before main optimizer
-  passes:
+  The workaround is to use a special attribute to make the BPF backend
+  apply the following transformation before optimizer passes:
 
   \begin{minted}[fontsize=\footnotesize]{c}
-struct bpf_sockopt { ... } __attribute__((preserve_static_offset));
-...
-switch (!\textcolor{Red}{@llvm.bpf.getelementptr.and.load.i32}!(ctx, 24)) {
-case 10:
-  g = bar(ctx->sk->family); // offsets of 0 are not tinkered with
-  break;
-case 20:
-  g = bar(!\textcolor{Red}{@llvm.bpf.getelementptr.and.load.i32}!(ctx, 32));
-  break;
-}
+  struct bpf_sockopt { ... } __attribute__((preserve_static_offset));
+  ...
+  switch (!\textcolor{Red}{@llvm.bpf.getelementptr.and.load.i32}!(ctx, 24)) {
+  case 10:
+    g = bar(ctx->sk->family); // offsets of 0 are not tinkered with
+    break;
+  case 20:
+    g = bar(!\textcolor{Red}{@llvm.bpf.getelementptr.and.load.i32}!(ctx, 32));
+    break;
+  }
   \end{minted}
 
   \code{llvm.bpf.getelementptr.and.load} calls are replaced by actual
@@ -471,9 +483,9 @@ case 20:
 \begin{frame}
 \frametitle{User visible workarounds}
 
-The set of transformations applied by LLVM backend is
-nowhere from being a complete remedy. This is evident
-from kernel bpf selftests themselves:
+The set of transformations applied by the LLVM backend is far from
+being a complete remedy. This is evident from the kernel BPF selftests
+themselves:
 
 \begin{itemize}
 \item \code{volatile} is used 302 times in 918 files.
@@ -481,29 +493,44 @@ from kernel bpf selftests themselves:
 \end{itemize}
 
 The issues are mostly similar to those already described. \\
-(No detailed case study available).
+(No detailed case study is available).
 
 \end{frame}
 
 \begin{frame}
 \frametitle{Conclusion}
 \begin{itemize}
-\item LLVM BPF backend strategy is so far reactive,
-      targeted counter-transformations are added when new
-      patterns are identified.
-\item What is the strategy for GCC BPF backend?
-\item Do we want to agree on certain \code{-Overifyable},
-      suggested some time ago by Jose Marchesi? \\
-      If we do, how should it be implemented:
-      \begin{itemize}
-      \item By targeted IR alternations, as LLVM does?
-      \item By backend specific checks in optimizations
-            themselves \\ (an option rejected by LLVM upstream)?
-      \item Given a big number of user-visible workarounds,
-            even an optimization pipeline completely separate
-            from existing \code{-O2} might be interesting.
-      \end{itemize}
+\item So far, the LLVM BPF backend strategy has been reactive, with
+  targeted counter-transformations added whenever new patterns are
+  identified.
+\item What is the strategy of the GCC BPF backend?
+\item Do we want to agree on a \code{-Overifyable} compilation mode,
+  as suggested some time ago by Jose Marchesi? \\
+  If so, how should it be implemented:
+  \begin{itemize}
+  \item By targeted IR alternations, as LLVM does?
+  \item Through backend-specific checks inside the optimizations themselves?\\
+    (An approach rejected by LLVM upstream).
+
+    % By backend specific checks in optimizations themselves \\ (an
+    % option rejected by LLVM upstream)?
+  \item Given the large number of user-visible workarounds, even an
+    optimization pipeline completely separate from existing \code{-O2}
+    might be worth considering.
+  \end{itemize}
 \end{itemize}
+\end{frame}
+
+\begin{frame}
+  \frametitle{Addendum: LLVM source code references}
+
+  The described transformations are implemented by:
+  \begin{itemize}
+  \item \code{BPFAdjustOptImpl::avoidSpeculation()}
+  \item \code{BPFAdjustOptImpl::serializeICMPCrossBB()}
+  \item \code{BPFAdjustOptImpl::serializeICMPInBB()}
+  \item \code{BPFPreserveStaticOffsetPass}
+  \end{itemize}
 \end{frame}
 
 \end{document}

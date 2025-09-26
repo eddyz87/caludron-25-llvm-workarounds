@@ -10,3 +10,6 @@ preview: pdf
 
 monitor:
 	while inotifywait -e close_write main.tex; do make preview; done
+
+release: pdf
+	cp ./build/main.pdf 'LLVM BPF backend optimizer workarounds.pdf'
